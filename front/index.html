@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mapa de Conexões</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Mapa de Conexões</h1>
+  <div class="chips" id="chips"></div>
+  <span class="spacer"></span>
+  <span id="flags"></span>
+  <span class="meta" id="upd"></span>
+</header>
+<main id="main">
+  <aside id="side">
+    <input id="q" placeholder="Buscar ponto...">
+    <div id="list"></div>
+  </aside>
+  <div id="map"></div>
+  <section id="panel"></section>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

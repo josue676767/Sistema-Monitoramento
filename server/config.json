@@ -1,0 +1,39 @@
+{
+  "mock": false,
+  "port": 8080,
+  "zabbix": {
+    "url": "http://localhost:8081/api_jsonrpc.php",
+    "token": "f5419ac8ef4e0de7443c4acc8aaebbe5e9b76d349ce20b06272bd400ed762e40",
+    "auth_in_body": false,
+    "verify_tls": true
+  },
+  "groups": ["Unidades", "Distribuicao"],
+  "metrics": {
+    "ping": "icmpping",
+    "latency": "icmppingsec",
+    "loss": "icmppingloss",
+    "in": "net.if.in",
+    "out": "net.if.out"
+  },
+  "latency_factor": 1000,
+  "stale_minutes": 15,
+  "cache_seconds": 30,
+  "problem_severity": { "warn": 2, "crit": 4 },
+  "thresholds": {
+    "wan": {
+      "latency_warn": 30, "latency_crit": 80, 
+      "loss_warn": 0.5, "loss_crit": 2,
+      "occ_warn": 70, "occ_crit": 90
+    },
+    "core-dist": {
+      "latency_warn": 1, "latency_crit": 5,
+      "loss_warn": 0.1, "loss_crit": 0.5,
+      "occ_warn": 60, "occ_crit": 85
+    },
+    "dist-acesso": {
+      "latency_warn": 2, "latency_crit": 10,
+      "loss_warn": 0.1, "loss_crit": 0.5,
+      "occ_warn": 60, "occ_crit": 85
+    }
+  }
+}
