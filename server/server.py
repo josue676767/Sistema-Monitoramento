@@ -1,5 +1,11 @@
-
-import json, math, os, random, ssl, time, threading, urllib.request
+#!/usr/bin/env python3
+"""Mapa de status de conexões a partir do Zabbix (estilo ViaIpê).
+ 
+Somente biblioteca padrão do Python 3.8+. Sem instalação de pacotes.
+  MOCK=1 python3 server.py   -> dados simulados
+  python3 server.py          -> usa config.json (mock=false para Zabbix real)
+"""
+import csv, json, math, os, random, ssl, sys, time, threading, urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -10,6 +16,7 @@ CFG = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
 if "MOCK" in os.environ:
     CFG["mock"] = os.environ["MOCK"] == "1"
 PORT = int(os.environ.get("PORT", CFG.get("port", 8080)))
+LOCAIS_PATH = BASE / CFG.get("locais_file", "locais.csv")
 LAT_FACTOR = CFG.get("latency_factor", 1000)
  
  
@@ -39,10 +46,77 @@ class Zabbix:
         return out["result"]
  
  
-ZBX = Zabbix(CFG["zabbix"])
+ZBX = None if CFG["mock"] else Zabbix(CFG["zabbix"])
 ITEMMAP = {}  # hostid -> {metric: (itemid, value_type)}
- 
 
+
+# ------------------------------------------- locais.csv (coordenadas fora do Zabbix)
+_locais = {"mtime": None, "data": {}}
+
+
+def _num(x):
+    try:
+        return float(str(x).strip().replace(",", "."))
+    except ValueError:
+        return None
+
+
+def load_locais():
+    """Lê locais.csv (host;lat;lon;tipo;capacidade_mbps;interface). Recarrega sozinho quando o arquivo muda."""
+    try:
+        mt = LOCAIS_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _locais["mtime"] != mt:
+        data = {}
+        lines = [l for l in LOCAIS_PATH.read_text(encoding="utf-8-sig").splitlines() if l.strip() and not l.lstrip().startswith("#")]
+        if lines:
+            delim = ";" if lines[0].count(";") >= lines[0].count(",") else ","
+            for row in csv.DictReader(lines, delimiter=delim):
+                row = {(k or "").strip().lower(): (x or "").strip() for k, x in row.items()}
+                if row.get("host"):
+                    data[row["host"].lower()] = row
+        _locais.update(mtime=mt, data=data)
+    return _locais["data"]
+
+
+def fetch_hosts():
+    """Hosts dos grupos configurados: {hostid: host}, com o nome do grupo em h['_group']."""
+    hosts = {}
+    groups = ZBX.call("hostgroup.get", {"filter": {"name": CFG["groups"]}, "output": ["groupid", "name"]})
+    for g in groups:
+        for h in ZBX.call("host.get", {
+            "groupids": [g["groupid"]], "monitored_hosts": True,
+            "output": ["hostid", "host", "name"],
+            "selectInventory": ["location_lat", "location_lon"],
+            "selectTags": "extend", "selectInterfaces": ["available"],
+        }):
+            h["_group"] = g.get("name", "")
+            hosts.setdefault(h["hostid"], h)
+    return hosts
+
+
+def write_template():
+    """python3 server.py --template : cria/atualiza locais.csv com os hosts do Zabbix (sem apagar o que já foi preenchido)."""
+    if ZBX is None:
+        sys.exit('Defina "mock": false no config.json para ler os hosts do Zabbix.')
+    cols = ["host", "nome", "lat", "lon", "tipo", "capacidade_mbps", "interface"]
+    rows = list(load_locais().values())
+    known = {k for r_ in rows for k in (r_.get("host", "").lower(), r_.get("nome", "").lower()) if k}
+    added = 0
+    for h in sorted(fetch_hosts().values(), key=lambda x: x["name"].lower()):
+        if h["host"].lower() in known or h["name"].lower() in known:
+            continue
+        tags = {t["tag"].lower(): t["value"] for t in h.get("tags", [])}
+        tipo = tags.get("tipo") or CFG.get("group_tipo", {}).get(h["_group"], "")
+        rows.append({"host": h["host"], "nome": h["name"], "tipo": tipo, "capacidade_mbps": tags.get("capacidade_mbps", "")})
+        added += 1
+    with open(LOCAIS_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.DictWriter(f, cols, delimiter=";", extrasaction="ignore")
+        w.writeheader(); w.writerows(rows)
+    print(f"{LOCAIS_PATH}: {len(rows)} linhas ({added} novas). Preencha lat e lon (ex.: -2,5530) e salve; o mapa recarrega sozinho.")
+ 
+ 
 # ------------------------------------------------------------ regras de status
 def classify(key):
     k = key.lower()
@@ -107,15 +181,10 @@ def to_float(x):
  
  
 def collect_real():
-    gids = [g["groupid"] for g in ZBX.call("hostgroup.get", {"filter": {"name": CFG["groups"]}, "output": ["groupid"]})]
-    hosts = ZBX.call("host.get", {
-        "groupids": gids, "monitored_hosts": True,
-        "output": ["hostid", "name"],
-        "selectInventory": ["location_lat", "location_lon"],
-        "selectTags": "extend", "selectInterfaces": ["available"],
-    })
+    hosts = list(fetch_hosts().values())
     if not hosts:
         return []
+    locais = load_locais()
     hids = [h["hostid"] for h in hosts]
     items = ZBX.call("item.get", {
         "hostids": hids, "monitored": True,
@@ -141,13 +210,17 @@ def collect_real():
     points = []
     for h in hosts:
         tags = {t["tag"].lower(): t["value"] for t in h.get("tags", [])}
-        tipo = tags.get("tipo", "wan")
-        cap = to_float(tags.get("capacidade_mbps")) or 0
-        iface = tags.get("interface")
+        # prioridade: locais.csv > tags do host > (inventário, só coordenadas) > grupo > padrão
+        loc = locais.get(h["host"].lower()) or locais.get(h["name"].lower()) or {}
+        tipo = loc.get("tipo") or tags.get("tipo") or CFG.get("group_tipo", {}).get(h.get("_group")) or "wan"
+        cap = _num(loc.get("capacidade_mbps")) or to_float(tags.get("capacidade_mbps")) or 0
+        iface = loc.get("interface") or tags.get("interface")
         inv = h.get("inventory") or {}
-        lat = to_float(inv.get("location_lat")) if inv else None
-        lon = to_float(inv.get("location_lon")) if inv else None
-        if lat is None:
+        lat, lon = _num(loc.get("lat")), _num(loc.get("lon"))
+        if lat is None or lon is None:
+            lat = to_float(inv.get("location_lat")) if inv else None
+            lon = to_float(inv.get("location_lon")) if inv else None
+        if lat is None or lon is None:
             lat, lon = to_float(tags.get("lat")), to_float(tags.get("lon"))
  
         best = {}  # metric -> (valor, itemid, value_type)
@@ -212,7 +285,83 @@ def history_real(hostid, t0, t1, n=300):
         out[metric] = downsample([[t, v * f] for t, v in ser], n)
     return out
  
-
+ 
+# ------------------------------------------------------------------ demonstração
+def _make_mock_hosts():
+    rnd = random.Random(7)
+    hs = []
+    states = ["ok"] * 13 + ["warn"] * 4 + ["crit"] * 2 + ["down", "nodata"]
+    rnd.shuffle(states)
+    for i in range(1, 22):  # unidades do interior
+        hs.append(dict(id=f"u{i}", name=f"Unidade Interior {i:02d}", tipo="wan",
+                       lat=rnd.uniform(-22, -3), lon=rnd.uniform(-52, -38),
+                       cap=rnd.choice([20, 50, 100, 200]), st=states[i - 1]))
+    campus = (-15.79, -47.88)
+    for i in range(1, 7):
+        hs.append(dict(id=f"d{i}", name=f"Distribuição Prédio {i}", tipo="core-dist",
+                       lat=campus[0] + rnd.uniform(-.004, .004), lon=campus[1] + rnd.uniform(-.004, .004),
+                       cap=10000, st="ok" if i != 3 else "warn"))
+    return hs
+ 
+ 
+MOCK_HOSTS = _make_mock_hosts()
+ 
+ 
+def _noise(key, bucket):
+    return random.Random(f"{key}-{bucket}").random()
+ 
+ 
+def _mock_values(h, ts):
+    wan = h["tipo"] == "wan"
+    st = h["st"]
+    r = _noise(h["id"], int(ts // 300))
+    lat_ok, lat_w, lat_c = ((12, 45, 120) if wan else (0.3, 2, 8))
+    base = {"ok": lat_ok, "warn": lat_w, "crit": lat_c, "down": 0, "nodata": 0}[st]
+    occ = {"ok": .25, "warn": .75, "crit": .93, "down": 0, "nodata": 0}[st]
+    day = 0.6 + 0.4 * math.sin((ts % 86400) / 86400 * 2 * math.pi - 1.5)
+    cap_bps = h["cap"] * 1e6
+    return {
+        "latency": base * (0.85 + 0.3 * r),
+        "loss": {"ok": 0.0, "warn": 0.4 if wan else 0.15, "crit": 3.0, "down": 100, "nodata": 0}[st] * (0.7 + 0.6 * r),
+        "in_bps": cap_bps * occ * day * (0.8 + 0.4 * r),
+        "out_bps": cap_bps * occ * day * 0.35 * (0.8 + 0.4 * r),
+    }
+ 
+ 
+def collect_mock():
+    pts = []
+    now = time.time()
+    for h in MOCK_HOSTS:
+        if h["st"] == "nodata":
+            vals = {}
+        elif h["st"] == "down":
+            vals = {"ping": 0}
+        else:
+            vals = dict(_mock_values(h, now), ping=1)
+        probs = []
+        if h["st"] == "crit":
+            probs = [{"text": "Perda de pacotes alta no enlace", "severity": 4}]
+        elif h["st"] == "down":
+            probs = [{"text": "Unidade inacessível (ICMP ping)", "severity": 5}]
+        elif h["st"] == "warn":
+            probs = [{"text": "Ocupação acima de 70%", "severity": 2}]
+        pts.append(build_point(h["id"], h["name"], h["lat"], h["lon"], h["tipo"], h["cap"], vals, probs, False))
+    return pts
+ 
+ 
+def history_mock(hostid, t0, t1, n=300):
+    h = next((x for x in MOCK_HOSTS if x["id"] == hostid), None)
+    if not h or h["st"] == "nodata":
+        return {}
+    step = max(10, int((t1 - t0) / n))
+    out = {"latency": [], "loss": [], "in": [], "out": []}
+    for ts in range(int(t0), int(t1), step):
+        v = _mock_values(h, ts)
+        out["latency"].append([ts, v["latency"]])
+        out["loss"].append([ts, v["loss"]])
+        out["in"].append([ts, v["in_bps"] / 1e6])
+        out["out"].append([ts, v["out_bps"] / 1e6])
+    return out
  
  
 # ------------------------------------------------------------------ cache + HTTP
@@ -224,7 +373,7 @@ def get_points():
     with _lock:
         if time.time() - _cache["t"] > CFG.get("cache_seconds", 30):
             try:
-                _cache["data"] = collect_real()
+                _cache["data"] = collect_mock() if CFG["mock"] else collect_real()
                 _cache["err"] = None
             except Exception as e:  # mantém último dado bom
                 _cache["err"] = str(e)
@@ -268,7 +417,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     t1 = now; t0 = now - min(float(q.get("hours", ["24"])[0]), 24 * 366) * 3600
                 n = max(50, min(int(q.get("n", ["300"])[0]), 1500))
-                data = history_real(hostid, t0, t1, n)
+                data = history_mock(hostid, t0, t1, n) if CFG["mock"] else history_real(hostid, t0, t1, n)
                 self._send(200, data)
             else:
                 self._send(404, {"error": "não encontrado"})
@@ -280,6 +429,9 @@ class Handler(BaseHTTPRequestHandler):
  
  
 if __name__ == "__main__":
-    modo = "Zabbix " + CFG["zabbix"]["url"]
+    if "--template" in sys.argv:
+        write_template()
+        sys.exit(0)
+    modo = "DEMONSTRAÇÃO (dados simulados)" if CFG["mock"] else "Zabbix " + CFG["zabbix"]["url"]
     print(f"Mapa de conexões em http://localhost:{PORT}  |  modo: {modo}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

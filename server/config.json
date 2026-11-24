@@ -2,8 +2,8 @@
   "mock": false,
   "port": 8080,
   "zabbix": {
-    "url": "http://localhost:8081/api_jsonrpc.php",
-    "token": "f5419ac8ef4e0de7443c4acc8aaebbe5e9b76d349ce20b06272bd400ed762e40",
+    "url": "",
+    "token": "",
     "auth_in_body": false,
     "verify_tls": true
   },
